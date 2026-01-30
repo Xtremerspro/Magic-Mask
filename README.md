@@ -53,6 +53,7 @@ pip install transparent-background torch torchvision pillow
 python magic_mask.py
 
 ```
+or run the `run.bat` file
 
 
 2. **Select Input:**
