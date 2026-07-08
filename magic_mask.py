@@ -5,20 +5,73 @@ import os
 from pathlib import Path
 from PIL import Image, ImageOps, ImageTk
 import torch
-import time  # Ensure this is added at the top of your script
+import time
+import cv2
+import numpy as np
+import subprocess  # Used for robust ProRes and HDR tone-mapped FFmpeg pipes
 
-# Import the core library
 from transparent_background import Remover
 
 
-# --- New Class for Interactive Cropping ---
+# --- Class for Interactive Cropping ---
 class CropSelector:
-    def __init__(self, parent, image_path, callback):
+    def __init__(self, parent, file_path, callback, tone_map_hdr=False):
         self.callback = callback
-        self.original_image_path = image_path
+        self.original_image_path = file_path
 
-        # 1. Load and prepare image for display
-        img = Image.open(image_path)
+        # Handle MP4 vs Image for the preview
+        if str(file_path).lower().endswith(".mp4"):
+            # If HDR tone mapping is enabled, extract the frame via FFmpeg to prevent washed out preview
+            if tone_map_hdr:
+                cmd = [
+                    "ffmpeg",
+                    "-ss",
+                    "00:00:00",
+                    "-i",
+                    str(file_path),
+                    "-vf",
+                    "zscale=t=linear:p=bt709,tonemap=tonemap=hable,zscale=t=bt709:m=bt709",
+                    "-vframes",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "-",
+                ]
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    )
+                    out, _ = proc.communicate()
+                    img = Image.open(io.BytesIO(out))
+                except:
+                    cap = cv2.VideoCapture(str(file_path))
+                    ret, frame = cap.read()
+                    cap.release()
+                    img = (
+                        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        if ret
+                        else None
+                    )
+            else:
+                cap = cv2.VideoCapture(str(file_path))
+                ret, frame = cap.read()
+                cap.release()
+                if ret:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(frame_rgb)
+                else:
+                    messagebox.showerror(
+                        "Error", "Could not read the first frame of the video."
+                    )
+                    return
+        else:
+            img = Image.open(file_path)
+
+        if img is None:
+            messagebox.showerror("Error", "Could not load image file preview.")
+            return
 
         # Resize for comfortable viewing (max 600x600)
         max_size = 600
@@ -26,9 +79,7 @@ class CropSelector:
         self.display_img = img.resize((int(img.width * ratio), int(img.height * ratio)))
         self.img_tk = ImageTk.PhotoImage(self.display_img)
 
-        self.scale_factor = (
-            img.width / self.display_img.width
-        )  # To scale selection back to original pixels
+        self.scale_factor = img.width / self.display_img.width
 
         self.root = tk.Toplevel(parent)
         self.root.title("Select Crop Area")
@@ -43,18 +94,15 @@ class CropSelector:
         self.canvas.pack(padx=10, pady=10)
         self.canvas.create_image(0, 0, image=self.img_tk, anchor="nw")
 
-        # Status Label
         tk.Label(
             self.root, text="Click and drag to select an area. Press ESC to cancel."
         ).pack(pady=5)
 
-        # Bind Mouse Events
         self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
         self.root.bind("<Escape>", lambda e: self.root.destroy())
 
-        # Selection variables
         self.start_x = None
         self.start_y = None
         self.rect = None
@@ -63,7 +111,6 @@ class CropSelector:
     def on_mouse_down(self, event):
         self.start_x = event.x
         self.start_y = event.y
-        # Delete previous rectangle if exists
         if self.rect:
             self.canvas.delete(self.rect)
         self.rect = self.canvas.create_rectangle(
@@ -78,30 +125,24 @@ class CropSelector:
 
     def on_mouse_drag(self, event):
         cur_x, cur_y = event.x, event.y
-        # Update the rectangle as the user drags
         self.canvas.coords(self.rect, self.start_x, self.start_y, cur_x, cur_y)
 
     def on_mouse_up(self, event):
         end_x, end_y = event.x, event.y
 
-        # Final coordinates on the display image
         display_x1 = min(self.start_x, end_x)
         display_y1 = min(self.start_y, end_y)
         display_x2 = max(self.start_x, end_x)
         display_y2 = max(self.start_y, end_y)
 
-        # Scale back to original image size for accurate cropping
         x1 = int(display_x1 * self.scale_factor)
         y1 = int(display_y1 * self.scale_factor)
         x2 = int(display_x2 * self.scale_factor)
         y2 = int(display_y2 * self.scale_factor)
 
         self.selected_coords = (x1, y1, x2, y2)
-
-        # Send the final coordinates back to the main app
         self.callback(self.selected_coords)
 
-        # Optionally, show the final crop box clearly
         self.canvas.delete(self.rect)
         self.rect = self.canvas.create_rectangle(
             display_x1, display_y1, display_x2, display_y2, outline="green", width=3
@@ -119,29 +160,31 @@ class MagicMaskApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Magic Mask Tool")
-        self.root.geometry("700x650")  # Slightly taller for the new button
+        self.root.geometry("700x750")  # Expanded height for extra options
         self.root.resizable(False, False)
 
-        # State variables
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
         self.model_type = tk.StringVar(value="base")
         self.invert_mask = tk.BooleanVar(value=False)
-        self.crop_box_var = tk.StringVar()  # This will be filled by the CropSelector
-        self.bg_color = None
+        self.crop_box_var = tk.StringVar()
 
+        # New Video/HDR Feature Variables
+        self.video_output_mode = tk.StringVar(
+            value="mask_only"
+        )  # mask_only, transparent_prores, solid_bg
+        self.tone_map_hdr = tk.BooleanVar(value=False)
+
+        self.bg_color = None
         self.is_processing = False
 
         self._setup_ui()
 
     def _setup_ui(self):
-        # ... (GUI setup remains largely the same, but add the new button)
-
-        # --- Header and I/O Frame setup (same as v3) ---
         header = tk.Label(
             self.root,
-            text="Magic Mask: Image Background Remover",
+            text="Magic Mask: Image & Video Background Remover",
             font=("Poppins", 16, "bold"),
         )
         header.pack(pady=15)
@@ -149,7 +192,6 @@ class MagicMaskApp:
         io_frame = tk.LabelFrame(self.root, text="Input & Output", padx=10, pady=10)
         io_frame.pack(fill="x", padx=20, pady=5)
 
-        # Input (row 0, 1)
         tk.Label(io_frame, text="Input (File or Folder):", anchor="w").grid(
             row=0, column=0, sticky="w", pady=2
         )
@@ -165,7 +207,6 @@ class MagicMaskApp:
             side="left"
         )
 
-        # Output (row 2, 3)
         tk.Label(io_frame, text="Output Folder:", anchor="w").grid(
             row=2, column=0, sticky="w", pady=2
         )
@@ -178,11 +219,9 @@ class MagicMaskApp:
             side="left", padx=5
         )
 
-        # --- Configuration Frame setup (same as v3) ---
         config_frame = tk.LabelFrame(self.root, text="Configuration", padx=10, pady=10)
         config_frame.pack(fill="x", padx=20, pady=5)
 
-        # Model Selection (row 0)
         tk.Label(config_frame, text="Model:").grid(row=0, column=0, padx=5, sticky="w")
         ttk.Radiobutton(
             config_frame,
@@ -197,17 +236,15 @@ class MagicMaskApp:
             value="fast",
         ).grid(row=0, column=2, sticky="w", padx=10)
 
-        # Invert Option (row 1)
         tk.Label(config_frame, text="Mode:").grid(
             row=1, column=0, padx=5, sticky="w", pady=5
         )
         ttk.Checkbutton(
             config_frame,
-            text="Invert Mask (Remove Object, Keep Background)",
+            text="Invert Mask (Keep Background)",
             variable=self.invert_mask,
         ).grid(row=1, column=1, columnspan=2, sticky="w")
 
-        # Background Color Option (row 2)
         tk.Label(config_frame, text="Background:").grid(
             row=2, column=0, padx=5, sticky="w", pady=5
         )
@@ -225,13 +262,39 @@ class MagicMaskApp:
             font=("Arial", 8),
         ).grid(row=2, column=2, sticky="w", padx=5)
 
-        # --- Interactive Crop Frame ---
+        # --- Enhanced Video Options Frame ---
+        video_frame = tk.LabelFrame(
+            self.root, text="Advanced Video Settings (MP4 Input Only)", padx=10, pady=10
+        )
+        video_frame.pack(fill="x", padx=20, pady=5)
+
+        tk.Label(video_frame, text="Output Format:").grid(
+            row=0, column=0, padx=5, sticky="w"
+        )
+        ttk.Radiobutton(
+            video_frame,
+            text="Mask Only (Greyscale MP4)",
+            variable=self.video_output_mode,
+            value="mask_only",
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(
+            video_frame,
+            text="Transparent Video (ProRes 4444 MOV)",
+            variable=self.video_output_mode,
+            value="transparent_prores",
+        ).grid(row=0, column=2, sticky="w", padx=10)
+
+        ttk.Checkbutton(
+            video_frame,
+            text="Enable HDR10+ to SDR Tonemapping (BT.2020 -> BT.709)",
+            variable=self.tone_map_hdr,
+        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(5, 0))
+
         crop_frame = tk.LabelFrame(
             self.root, text="Interactive Crop Selection", padx=10, pady=5
         )
         crop_frame.pack(fill="x", padx=20, pady=5)
 
-        # New Button to launch the selector
         tk.Button(
             crop_frame,
             text="Select Crop Area Visually",
@@ -241,7 +304,6 @@ class MagicMaskApp:
             font=("Arial", 10, "bold"),
         ).pack(side="left", padx=10)
 
-        # Entry box to show the resulting coordinates
         tk.Label(crop_frame, text="Coords (X1, Y1, X2, Y2):").pack(side="left")
         tk.Entry(crop_frame, textvariable=self.crop_box_var, width=30).pack(
             side="left", padx=5
@@ -253,11 +315,10 @@ class MagicMaskApp:
             font=("Arial", 8),
         ).pack(side="left")
 
-        # --- Action Area (same as v3) ---
         self.progress = ttk.Progressbar(
             self.root, orient="horizontal", length=400, mode="determinate"
         )
-        self.progress.pack(pady=20)
+        self.progress.pack(pady=15)
 
         self.status_label = tk.Label(self.root, textvariable=self.status_var, fg="gray")
         self.status_label.pack()
@@ -273,32 +334,35 @@ class MagicMaskApp:
         )
         self.btn_process.pack(pady=10, fill="x", padx=150)
 
-    # --- New Function to Launch Selector ---
     def launch_crop_selector(self):
         input_path = self.input_path.get()
         if not input_path or not Path(input_path).is_file():
             messagebox.showwarning(
                 "Input Needed",
-                "Please select a single image file first to use the visual selector.",
+                "Please select a single file first to use the visual selector.",
             )
             return
-
-        # Start the interactive selector window
-        CropSelector(self.root, input_path, self.update_crop_box)
+        CropSelector(
+            self.root,
+            input_path,
+            self.update_crop_box,
+            tone_map_hdr=self.tone_map_hdr.get(),
+        )
 
     def update_crop_box(self, coords):
-        """Callback function to receive the selected coordinates."""
         self.crop_box_var.set(f"{coords[0]}, {coords[1]}, {coords[2]}, {coords[3]}")
 
-    # ... (Other helper functions and run_processing logic remain the same as v3)
-    # NOTE: The run_processing function in v3 is already correct and compatible with this new input method.
-
-    # --- Helper functions (browse, color, status, reset) are omitted here for brevity but are in the full code. ---
     def pick_color(self):
         color = colorchooser.askcolor(title="Choose Background Color")
         if color[1]:
             self.bg_color = color[0]
             self.btn_color.config(text=f"Color: {color[1]}", bg=color[1], fg="black")
+            if self.video_output_mode.get() == "transparent_prores":
+                self.video_output_mode.set("mask_only")
+                messagebox.showinfo(
+                    "Mode Adjusted",
+                    "ProRes 4444 mode sets true transparent values. Switched format destination mode.",
+                )
 
     def reset_color(self):
         self.bg_color = None
@@ -308,11 +372,12 @@ class MagicMaskApp:
 
     def browse_file(self):
         filename = filedialog.askopenfilename(
-            filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.webp;*.bmp")]
+            filetypes=[
+                ("Images & Videos", "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.mp4;*.mov")
+            ]
         )
         if filename:
             self.input_path.set(filename)
-            # If input is a file, clear folder path
             if Path(filename).is_file():
                 current_out = self.output_path.get()
                 if (
@@ -334,7 +399,6 @@ class MagicMaskApp:
         if folder:
             self.output_path.set(folder)
 
-    # --- Processing Core (This is the run_processing function from v3, re-included for completeness) ---
     def start_thread(self):
         if self.is_processing:
             return
@@ -355,14 +419,12 @@ class MagicMaskApp:
         try:
             self.update_status("Loading AI Model...")
 
-            # Device Selection
             device = "cuda" if torch.cuda.is_available() else "cpu"
             if device == "cpu" and torch.backends.mps.is_available():
                 device = "mps"
 
             remover = Remover(mode=self.model_type.get(), device=device)
 
-            # Parse Crop Coordinates
             crop_coords = None
             crop_input = self.crop_box_var.get().strip()
             if crop_input:
@@ -372,85 +434,263 @@ class MagicMaskApp:
                 except:
                     pass
 
-            # Gather files
             input_path_obj = Path(in_path)
             if input_path_obj.is_file():
                 files = [input_path_obj]
             else:
-                exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+                exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".mp4", ".mov"}
                 files = [
                     f for f in input_path_obj.iterdir() if f.suffix.lower() in exts
                 ]
 
             if not files:
-                raise ValueError("No valid images found.")
+                raise ValueError("No valid source files found.")
 
             os.makedirs(out_path, exist_ok=True)
-
             total = len(files)
             start_time = time.time()
 
             for i, file_path in enumerate(files):
-                # Calculate ETA
+                is_video = file_path.suffix.lower() in {".mp4", ".mov"}
+
                 elapsed = time.time() - start_time
                 if i > 0:
                     avg_time_per_img = elapsed / i
                     remaining_imgs = total - i
                     eta_seconds = int(avg_time_per_img * remaining_imgs)
-
-                    # Format seconds to MM:SS
                     mins, secs = divmod(eta_seconds, 60)
                     eta_str = f" | ETA: {mins:02d}:{secs:02d}"
                 else:
                     eta_str = " | ETA: Calculating..."
 
-                self.update_status(f"Processing {i+1}/{total}{eta_str}")
+                if is_video:
+                    self.update_status(
+                        f"Processing Video {i+1}/{total} (Analyzing frames...)"
+                    )
 
-                # --- Core Processing Logic ---
-                original_img = Image.open(file_path).convert("RGB")
-                original_size = original_img.size
-                img_to_process = original_img.copy()
+                    # Read properties using default capture pipeline
+                    cap = cv2.VideoCapture(str(file_path))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
 
-                if crop_coords:
-                    try:
-                        img_to_process = original_img.crop(crop_coords)
-                    except:
-                        img_to_process = original_img.copy()
+                    if fps <= 0 or np.isnan(fps):
+                        fps = 30.0
 
-                mask_img = remover.process(img_to_process, type="map").convert("L")
+                    mode = self.video_output_mode.get()
 
-                if self.invert_mask.get():
-                    mask_img = ImageOps.invert(mask_img)
-
-                img_to_process = img_to_process.convert("RGBA")
-
-                if crop_coords:
-                    final_img = Image.new("RGBA", original_size, (0, 0, 0, 0))
-                    img_to_process.putalpha(mask_img)
-                    final_img.paste(img_to_process, crop_coords, img_to_process)
-                    if self.bg_color:
-                        solid_bg = Image.new("RGB", original_size, self.bg_color)
-                        solid_bg.paste(final_img, (0, 0), final_img)
-                        final_img = solid_bg
-                else:
-                    if self.bg_color:
-                        final_img = Image.new("RGB", original_size, self.bg_color)
-                        final_img.paste(original_img.convert("RGB"), (0, 0), mask_img)
+                    # Determine target output format configuration
+                    if mode == "transparent_prores":
+                        save_path = os.path.join(
+                            out_path, f"{file_path.stem}_alpha.mov"
+                        )
+                        # Added -loglevel error to suppress verbose stream outputs
+                        ffmpeg_cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-loglevel",
+                            "error",
+                            "-f",
+                            "rawvideo",
+                            "-pix_fmt",
+                            "rgba",
+                            "-s",
+                            f"{orig_width}x{orig_height}",
+                            "-r",
+                            f"{fps}",
+                            "-i",
+                            "-",
+                            "-c:v",
+                            "prores_ks",
+                            "-profile:v",
+                            "4",
+                            "-vendor",
+                            "appl",
+                            "-pix_fmt",
+                            "yuva444p10le",
+                            save_path,
+                        ]
                     else:
-                        final_img = original_img.convert("RGBA")
-                        final_img.putalpha(mask_img)
+                        save_path = os.path.join(out_path, f"{file_path.stem}_mask.mp4")
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        video_writer = cv2.VideoWriter(
+                            save_path,
+                            fourcc,
+                            fps,
+                            (orig_width, orig_height),
+                            isColor=True,
+                        )
 
-                save_path = os.path.join(out_path, f"{file_path.stem}_masked.png")
-                final_img.save(save_path, "PNG")
+                    # Initialize Video Source Capture Pipeline (with/without Tone mapping)
+                    if self.tone_map_hdr.get():
+                        # Added -loglevel error here as well
+                        src_cmd = [
+                            "ffmpeg",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            str(file_path),
+                            "-vf",
+                            "zscale=t=linear:p=bt709,tonemap=tonemap=hable,zscale=t=bt709:m=bt709",
+                            "-f",
+                            "rawvideo",
+                            "-pix_fmt",
+                            "rgb24",
+                            "-",
+                        ]
+                        video_stream = subprocess.Popen(
+                            src_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                        )
+                    else:
+                        cap = cv2.VideoCapture(str(file_path))
 
-                progress_val = ((i + 1) / total) * 100
-                self.root.after(
-                    0, lambda v=progress_val: self.progress.configure(value=v)
-                )
+                    frame_count = 0
+                    ffmpeg_proc = None
+                    try:
+                        if mode == "transparent_prores":
+                            # Changed stderr to DEVNULL to prevent OS pipe buffer allocation deadlocks
+                            ffmpeg_proc = subprocess.Popen(
+                                ffmpeg_cmd,
+                                stdin=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                            )
+
+                        while True:
+                            if self.tone_map_hdr.get():
+                                raw_frame = video_stream.stdout.read(
+                                    orig_width * orig_height * 3
+                                )
+                                if not raw_frame or len(raw_frame) != (
+                                    orig_width * orig_height * 3
+                                ):
+                                    break
+                                frame_np = np.frombuffer(
+                                    raw_frame, dtype=np.uint8
+                                ).reshape((orig_height, orig_width, 3))
+                                original_img = Image.fromarray(frame_np)
+                            else:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                original_img = Image.fromarray(frame_rgb)
+
+                            img_to_process = original_img.copy()
+
+                            if crop_coords:
+                                try:
+                                    img_to_process = original_img.crop(crop_coords)
+                                except:
+                                    pass
+
+                            mask_img = remover.process(
+                                img_to_process, type="map"
+                            ).convert("L")
+
+                            if self.invert_mask.get():
+                                mask_img = ImageOps.invert(mask_img)
+
+                            if crop_coords:
+                                final_mask = Image.new(
+                                    "L", (orig_width, orig_height), 0
+                                )
+                                final_mask.paste(mask_img, crop_coords)
+                            else:
+                                final_mask = mask_img
+
+                            if mode == "transparent_prores":
+                                rgba_img = original_img.convert("RGBA")
+                                rgba_img.putalpha(final_mask)
+                                ffmpeg_proc.stdin.write(rgba_img.tobytes())
+                            else:
+                                final_mask_np = np.array(final_mask)
+                                final_frame_bgr = cv2.cvtColor(
+                                    final_mask_np, cv2.COLOR_GRAY2BGR
+                                )
+                                video_writer.write(final_frame_bgr)
+
+                            frame_count += 1
+
+                            if frame_count % 5 == 0:
+                                self.update_status(
+                                    f"Processing Video {i+1}/{total} (Frame {frame_count}/{total_frames or '?'}){eta_str}"
+                                )
+                                if total_frames > 0:
+                                    progress_val = (
+                                        (i + (frame_count / total_frames)) / total
+                                    ) * 100
+                                    self.root.after(
+                                        0,
+                                        lambda v=progress_val: self.progress.configure(
+                                            value=v
+                                        ),
+                                    )
+                    finally:
+                        if self.tone_map_hdr.get():
+                            video_stream.terminate()
+                            video_stream.wait()
+                        else:
+                            cap.release()
+
+                        if mode == "transparent_prores" and ffmpeg_proc:
+                            if ffmpeg_proc.stdin:
+                                ffmpeg_proc.stdin.close()
+                            ffmpeg_proc.wait()
+                        elif mode != "transparent_prores":
+                            video_writer.release()
+
+                else:
+                    # Keep existing standard standalone image execution stack logic intact
+                    self.update_status(f"Processing Image {i+1}/{total}{eta_str}")
+
+                    original_img = Image.open(file_path).convert("RGB")
+                    original_size = original_img.size
+                    img_to_process = original_img.copy()
+
+                    if crop_coords:
+                        try:
+                            img_to_process = original_img.crop(crop_coords)
+                        except:
+                            pass
+
+                    mask_img = remover.process(img_to_process, type="map").convert("L")
+
+                    if self.invert_mask.get():
+                        mask_img = ImageOps.invert(mask_img)
+
+                    img_to_process = img_to_process.convert("RGBA")
+
+                    if crop_coords:
+                        final_img = Image.new("RGBA", original_size, (0, 0, 0, 0))
+                        img_to_process.putalpha(mask_img)
+                        final_img.paste(img_to_process, crop_coords, img_to_process)
+                        if self.bg_color:
+                            solid_bg = Image.new("RGB", original_size, self.bg_color)
+                            solid_bg.paste(final_img, (0, 0), final_img)
+                            final_img = solid_bg
+                    else:
+                        if self.bg_color:
+                            final_img = Image.new("RGB", original_size, self.bg_color)
+                            final_img.paste(
+                                original_img.convert("RGB"), (0, 0), mask_img
+                            )
+                        else:
+                            final_img = original_img.convert("RGBA")
+                            final_img.putalpha(mask_img)
+
+                    save_path = os.path.join(out_path, f"{file_path.stem}_masked.png")
+                    final_img.save(save_path, "PNG")
+
+                    progress_val = ((i + 1) / total) * 100
+                    self.root.after(
+                        0, lambda v=progress_val: self.progress.configure(value=v)
+                    )
 
             self.update_status("Complete!")
             self.root.after(
-                0, lambda: messagebox.showinfo("Success", f"Processed {total} images.")
+                0, lambda: messagebox.showinfo("Success", f"Processed {total} file(s).")
             )
 
         except Exception as e:
